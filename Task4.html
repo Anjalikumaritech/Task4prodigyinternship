@@ -1,0 +1,538 @@
+<<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Peer-to-Peer Chat (tabs only)</title>
+<style>
+  :root{--bg:#0f172a;--card:#fff;--muted:#64748b;--accent:#4f46e5}
+  body{font-family:Inter,system-ui,Segoe UI,Roboto,Arial; margin:0; background:#f1f5f9; color:#0f172a}
+  .app{max-width:1100px;margin:18px auto;padding:12px}
+  header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+  h1{font-size:1.2rem;margin:0}
+  .layout{display:grid;grid-template-columns:220px 1fr 260px;gap:12px}
+  .panel{background:var(--card);border-radius:10px;padding:12px;box-shadow:0 6px 18px rgba(2,6,23,0.06)}
+  .rooms button, .users button{display:block;width:100%;text-align:left;padding:8px;border-radius:8px;border:1px solid #eef2ff;background:#fff;margin-bottom:6px;cursor:pointer}
+  .rooms input,.users input,.composer input,.composer select,.composer textarea{width:100%;padding:8px;border-radius:8px;border:1px solid #e6eef6}
+  .messages{height:58vh;overflow:auto;padding:8px;border-radius:8px;background:#fbfdff;border:1px solid #eef2ff}
+  .msg{margin-bottom:8px;padding:8px;border-radius:8px;max-width:78%;}
+  .meta{font-size:0.8rem;color:var(--muted)}
+  .msg.me{margin-left:auto;background:#eef2ff}
+  .msg.other{background:#f3f4f6}
+  .row{display:flex;gap:8px;align-items:center}
+  .btn{padding:8px 10px;border-radius:8px;border:none;background:var(--accent);color:white;cursor:pointer}
+  .btn.ghost{background:#eef2ff;color:var(--accent)}
+  .small{font-size:0.85rem;color:var(--muted)}
+  .presence-dot{display:inline-block;width:10px;height:10px;border-radius:999px;margin-right:8px;vertical-align:middle}
+  footer{margin-top:12px;text-align:center;color:var(--muted);font-size:0.85rem}
+  @media (max-width:900px){ .layout{grid-template-columns:1fr; } .messages{height:45vh} }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>Peer-to-Peer Chat — Tabs Demo</h1>
+    <div class="small">Open this file in multiple tabs to chat in real time</div>
+  </header>
+
+  <div id="app-root"></div>
+
+  <footer>Demo uses <strong>BroadcastChannel</strong> (same-origin browser tabs). Not for production.</footer>
+</div>
+
+<script>
+/*
+  p2p_chat.html
+  - Uses BroadcastChannel 'p2p-chat' to share messages across tabs
+  - Save accounts & rooms & history in localStorage
+  - Supports rooms and private messages (to specific username)
+*/
+
+(function(){
+  // Utilities
+  const BC_NAME = 'p2p-chat-channel-v1';
+  const channel = new BroadcastChannel(BC_NAME);
+  const LS = window.localStorage;
+
+  function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2,8); }
+  function nowISO(){ return new Date().toISOString(); }
+  function store(key, val){ LS.setItem(key, JSON.stringify(val)); }
+  function load(key, fallback){ try{ const v=JSON.parse(LS.getItem(key)); return v===null? fallback : (v ?? fallback); }catch(e){ return fallback; } }
+
+  // Keys
+  const KEY_USERS = 'p2p_users';       // local known users (list)
+  const KEY_ROOMS = 'p2p_rooms';       // available rooms
+  // messages are saved per room: key = messages:room:{roomName}
+  // private messages key: pm:{userA}:{userB} with sorted names
+
+  // Default data
+  if(!load(KEY_ROOMS)) store(KEY_ROOMS, ['General']);
+
+  // Presence TTL: we consider a user offline if no heartbeat in X ms
+  const PRESENCE_TTL = 15000; // 15s
+
+  // App state
+  let me = load('p2p_current_user') || null;      // { username, id } persisted per tab
+  let tabId = uid();
+  let presenceMap = {}; // username -> { lastSeen, tabIds: Set }
+
+  // UI root
+  const root = document.getElementById('app-root');
+
+  // Render login if no username
+  function render(){
+    if(!me) return renderAuth();
+    return renderMain();
+  }
+
+  // Auth (choose username)
+  function renderAuth(){
+    root.innerHTML = `
+      <div class="panel" style="max-width:480px;margin:0 auto">
+        <h3>Pick a username</h3>
+        <p class="small">This demo stores your name locally. Open another tab and choose a different name to simulate another user.</p>
+        <div style="margin-top:8px">
+          <input id="usernameInput" placeholder="e.g. alice" />
+        </div>
+        <div style="margin-top:8px;display:flex;gap:8px">
+          <button id="btnJoin" class="btn">Join Chat</button>
+          <button id="btnGuest" class="btn ghost">Quick Guest</button>
+        </div>
+      </div>
+    `;
+    document.getElementById('btnJoin').onclick = ()=> {
+      const v = document.getElementById('usernameInput').value.trim();
+      if(!v) return alert('Enter a username');
+      setUser(v);
+    };
+    document.getElementById('btnGuest').onclick = ()=> {
+      setUser('guest-' + Math.random().toString(36).slice(2,6));
+    };
+  }
+
+  function setUser(username){
+    me = { username: username, id: uid() };
+    store('p2p_current_user', me);
+    // add to users list (global localStorage list)
+    const users = new Set(load(KEY_USERS, []));
+    users.add(username);
+    store(KEY_USERS, Array.from(users));
+    broadcastPresence('online');
+    render();
+  }
+
+  // main interface
+  function renderMain(){
+    const rooms = load(KEY_ROOMS, ['General']);
+    const currentRoom = load('p2p_current_room') || rooms[0];
+    const targetDM = load('p2p_current_dm') || null; // username or null
+
+    // build HTML
+    root.innerHTML = `
+      <div class="layout">
+        <aside class="panel">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <div>
+              <strong>${escapeHtml(me.username)}</strong>
+              <div class="small">Tab ID: ${tabId.slice(0,6)}</div>
+            </div>
+            <div>
+              <button id="btnLogout" class="btn ghost">Logout</button>
+            </div>
+          </div>
+
+          <hr style="margin:10px 0"/>
+
+          <div>
+            <h4 style="margin:6px 0">Rooms</h4>
+            <div class="rooms" id="roomsList"></div>
+            <div style="margin-top:8px">
+              <input id="newRoomInput" placeholder="New room name" />
+              <div style="margin-top:6px"><button id="btnCreateRoom" class="btn ghost">Create</button></div>
+            </div>
+          </div>
+
+        </aside>
+
+        <main class="panel">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <div>
+              <strong id="chatTitle"></strong>
+              <div class="small" id="chatSubtitle"></div>
+            </div>
+            <div>
+              <button id="btnClearHistory" class="btn ghost">Clear history</button>
+            </div>
+          </div>
+
+          <div class="messages" id="messagesArea"></div>
+
+          <div style="margin-top:8px" class="composer">
+            <div class="row" style="gap:8px">
+              <select id="recipientSelect" style="width:220px">
+                <option value="">-- Send to room (public) --</option>
+              </select>
+              <input id="msgInput" placeholder="Type a message and press Enter" />
+              <button id="btnSend" class="btn">Send</button>
+            </div>
+          </div>
+        </main>
+
+        <aside class="panel">
+          <h4 style="margin:6px 0">Users</h4>
+          <div class="users" id="usersList"></div>
+
+          <hr style="margin:10px 0"/>
+          <div class="small">Presence shows status across tabs for same username</div>
+        </aside>
+      </div>
+    `;
+
+    // wire events
+    document.getElementById('btnLogout').onclick = logout;
+    document.getElementById('btnCreateRoom').onclick = createRoomFromInput;
+    document.getElementById('btnSend').onclick = sendMessageFromInput;
+    document.getElementById('msgInput').onkeydown = (e)=>{ if(e.key==='Enter'){ sendMessageFromInput(); } };
+    document.getElementById('btnClearHistory').onclick = ()=>{ clearHistory(currentRoom); };
+
+    // fill rooms & users
+    populateRooms();
+    populateUsers();
+    populateRecipientSelect();
+
+    // show messages for current context (room or DM)
+    if(targetDM) openDM(targetDM); else openRoom(currentRoom);
+
+    // focus input
+    document.getElementById('msgInput').focus();
+  }
+
+  // escape HTML for safe display
+  function escapeHtml(s){ return (''+s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+  // Rooms UI
+  function populateRooms(){
+    const rooms = load(KEY_ROOMS, ['General']);
+    const roomsList = document.getElementById('roomsList');
+    roomsList.innerHTML = '';
+    const current = load('p2p_current_room') || rooms[0];
+    rooms.forEach(r=>{
+      const btn = document.createElement('button');
+      btn.textContent = '#' + r;
+      btn.onclick = ()=>{ openRoom(r); };
+      if(r === current) btn.style.background = '#eef2ff';
+      roomsList.appendChild(btn);
+    });
+  }
+
+  function createRoomFromInput(){
+    const nv = document.getElementById('newRoomInput').value.trim();
+    if(!nv) return;
+    const rooms = new Set(load(KEY_ROOMS, []));
+    rooms.add(nv);
+    store(KEY_ROOMS, Array.from(rooms));
+    broadcastMeta({ type:'room_created', room:nv, by:me.username, ts: nowISO() });
+    populateRooms();
+    document.getElementById('newRoomInput').value = '';
+  }
+
+  // Users UI
+  function populateUsers(){
+    const users = load(KEY_USERS, []);
+    const usersList = document.getElementById('usersList');
+    usersList.innerHTML = '';
+    users.forEach(u=>{
+      const div = document.createElement('div');
+      const status = presenceMap[u] && (Date.now() - presenceMap[u].lastSeen < PRESENCE_TTL) ? 'online' : 'offline';
+      div.innerHTML = `<span class="presence-dot" style="background:${status==='online'?'#10b981':'#cbd5e1'}"></span>
+                       <strong>${escapeHtml(u)}</strong>
+                       <div class="small"> ${status} </div>`;
+      // make clickable to open DM
+      div.style.cursor = 'pointer';
+      div.onclick = ()=>{ openDM(u); };
+      usersList.appendChild(div);
+    });
+  }
+
+  function populateRecipientSelect(){
+    const sel = document.getElementById('recipientSelect');
+    sel.innerHTML = '<option value="">-- Send to room (public) --</option>';
+    const users = load(KEY_USERS, []).filter(u => u !== me.username);
+    users.forEach(u => {
+      const opt = document.createElement('option');
+      opt.value = u;
+      opt.textContent = 'DM: ' + u;
+      sel.appendChild(opt);
+    });
+    // also populate with rooms as quick choice
+    const rooms = load(KEY_ROOMS, []);
+    const optGroup = document.createElement('optgroup');
+    optGroup.label = 'Rooms';
+    rooms.forEach(r=>{
+      const opt = document.createElement('option');
+      opt.value = '#room:'+r;
+      opt.textContent = 'Room: ' + r;
+      optGroup.appendChild(opt);
+    });
+    sel.appendChild(optGroup);
+    // selection handling
+    sel.onchange = ()=> {
+      const v = sel.value;
+      if(!v) { // back to current location (do nothing)
+        return;
+      }
+      if(v.startsWith('#room:')){
+        const r = v.slice(6);
+        openRoom(r);
+      } else {
+        openDM(v);
+      }
+      sel.value = '';
+    };
+  }
+
+  // Open a room
+  function openRoom(roomName){
+    store('p2p_current_room', roomName);
+    store('p2p_current_dm', null);
+    populateRooms();
+    populateRecipientSelect();
+    document.getElementById('chatTitle').textContent = '#' + roomName;
+    document.getElementById('chatSubtitle').textContent = 'Public room messages';
+    renderMessagesForRoom(roomName);
+  }
+
+  // Open DM with specific user
+  function openDM(username){
+    store('p2p_current_dm', username);
+    document.getElementById('chatTitle').textContent = 'DM with ' + username;
+    document.getElementById('chatSubtitle').textContent = 'Private conversation';
+    renderMessagesForDM(me.username, username);
+  }
+
+  // Storage keys for messages
+  function keyForRoom(room){ return 'p2p_msgs_room:' + room; }
+  function keyForPM(a,b){
+    const arr = [a,b].sort(); return 'p2p_msgs_pm:' + arr[0] + '::' + arr[1];
+  }
+
+  // Save and load messages
+  function saveMsgForRoom(room, msgObj){
+    const key = keyForRoom(room);
+    const arr = load(key, []);
+    arr.push(msgObj);
+    store(key, arr.slice(-500)); // cap
+  }
+  function loadMsgsForRoom(room){ return load(keyForRoom(room), []); }
+
+  function saveMsgForPM(a,b,msgObj){ const key=keyForPM(a,b); const arr=load(key,[]); arr.push(msgObj); store(key, arr.slice(-500)); }
+  function loadMsgsForPM(a,b){ return load(keyForPM(a,b), []); }
+
+  // render messages
+  function renderMessagesForRoom(room){
+    const msgs = loadMsgsForRoom(room);
+    const container = document.getElementById('messagesArea');
+    container.innerHTML = '';
+    msgs.forEach(m => appendMessageDOM(container, m, room, null));
+    container.scrollTop = container.scrollHeight;
+  }
+
+  function renderMessagesForDM(a,b){
+    const msgs = loadMsgsForPM(a,b);
+    const container = document.getElementById('messagesArea');
+    container.innerHTML = '';
+    msgs.forEach(m => appendMessageDOM(container, m, null, {a,b}));
+    container.scrollTop = container.scrollHeight;
+  }
+
+  function appendMessageDOM(container, m, room=null, pmPair=null){
+    const div = document.createElement('div');
+    const cls = m.from === me.username ? 'msg me' : 'msg other';
+    div.className = cls;
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.innerHTML = `<strong>${escapeHtml(m.from)}</strong> • <span class="small">${new Date(m.ts).toLocaleString()}</span>`;
+    const content = document.createElement('div');
+    content.innerHTML = escapeHtml(m.text).replace(/\n/g,'<br/>');
+    div.appendChild(meta);
+    div.appendChild(content);
+    container.appendChild(div);
+  }
+
+  // sending
+  function sendMessageFromInput(){
+    const input = document.getElementById('msgInput');
+    const text = input.value.trim();
+    if(!text) return;
+    // determine current target
+    const dm = load('p2p_current_dm') || null;
+    if(dm){
+      // private message
+      const msg = { id: uid(), from: me.username, to: dm, text, ts: nowISO(), kind: 'private' };
+      // persist locally
+      saveMsgForPM(me.username, dm, msg);
+      // broadcast
+      channel.postMessage({ type:'message', payload: msg });
+      // render to DOM
+      renderMessagesForDM(me.username, dm);
+    } else {
+      const room = load('p2p_current_room') || load(KEY_ROOMS, ['General'])[0];
+      const msg = { id: uid(), from: me.username, room, text, ts: nowISO(), kind: 'room' };
+      saveMsgForRoom(room, msg);
+      channel.postMessage({ type:'message', payload: msg });
+      renderMessagesForRoom(room);
+    }
+    input.value = '';
+  }
+
+  // clear history for current room/DM
+  function clearHistory(room){
+    if(load('p2p_current_dm')){ // DM
+      const other = load('p2p_current_dm');
+      store(keyForPM(me.username, other), []);
+      renderMessagesForDM(me.username, other);
+      return;
+    }
+    const r = load('p2p_current_room') || load(KEY_ROOMS, ['General'])[0];
+    store(keyForRoom(r), []);
+    renderMessagesForRoom(r);
+  }
+
+  // logout
+  function logout(){
+    // remove current user for this tab only
+    LS.removeItem('p2p_current_user');
+    me = null;
+    render();
+    broadcastPresence('offline');
+  }
+
+  // Broadcast meta and messages
+  function broadcastMeta(obj){
+    channel.postMessage({ type:'meta', payload: obj, senderTab: tabId });
+  }
+
+  function broadcastPresence(status){
+    const payload = { type:'presence', user: me ? me.username : null, tabId, status, ts: nowISO() };
+    channel.postMessage(payload);
+  }
+
+  // Handle incoming channel messages
+  channel.onmessage = (ev) => {
+    const msg = ev.data;
+    // handle presence and meta types specially
+    if(msg && msg.type === 'meta'){
+      // room_created etc
+      if(msg.payload && msg.payload.type === 'room_created'){
+        // update rooms list
+        const rooms = new Set(load(KEY_ROOMS, []));
+        rooms.add(msg.payload.room);
+        store(KEY_ROOMS, Array.from(rooms));
+        // update UI
+        if(document.getElementById('roomsList')) populateRooms();
+      }
+      return;
+    }
+    if(msg && msg.type === 'presence'){
+      const u = msg.user;
+      if(!u) return;
+      const prev = presenceMap[u] || { lastSeen:0, tabs: new Set() };
+      prev.lastSeen = Date.now();
+      // track tabs
+      prev.tabs = prev.tabs || new Set();
+      if(msg.status === 'online') prev.tabs.add(msg.tabId);
+      if(msg.status === 'offline') prev.tabs.delete && prev.tabs.delete(msg.tabId);
+      presenceMap[u] = prev;
+      // ensure user added to known users
+      const s = new Set(load(KEY_USERS, [])); s.add(u); store(KEY_USERS, Array.from(s));
+      if(document.getElementById('usersList')) populateUsers();
+      if(document.getElementById('roomsList')) populateRecipientSelect();
+      return;
+    }
+    // messages
+    if(msg && msg.type === 'message' && msg.payload){
+      const p = msg.payload;
+      if(p.kind === 'room'){
+        // persist for that room
+        saveMsgForRoom(p.room, p);
+        // if current room open, render
+        const curRoom = load('p2p_current_room');
+        const curDM = load('p2p_current_dm') || null;
+        if(!curDM && curRoom === p.room){
+          renderMessagesForRoom(p.room);
+        } else {
+          // optional: show badge (skipped)
+        }
+        return;
+      } else if(p.kind === 'private'){
+        // persist if user is sender or recipient
+        saveMsgForPM(p.from, p.to, p);
+        // if this tab's user is recipient or sender, and currently in that DM, render
+        const curDM = load('p2p_current_dm') || null;
+        if(curDM && ( (p.from === curDM && p.to === me.username) || (p.to === curDM && p.from === me.username) )){
+          renderMessagesForDM(me.username, curDM);
+        }
+        return;
+      }
+    }
+  };
+
+  // on unload, mark offline for this tab
+  window.addEventListener('beforeunload', ()=> {
+    // send offline presence for this tab
+    channel.postMessage({ type:'presence', user: me ? me.username : null, tabId, status:'offline', ts: nowISO() });
+  });
+
+  // heartbeat to indicate online
+  setInterval(()=> {
+    if(me) channel.postMessage({ type:'presence', user: me.username, tabId, status:'online', ts: nowISO() });
+  }, 7000);
+
+  // initial presence announce when user set
+  // if me existed on load, send presence
+  if(me) setTimeout(()=> broadcastPresence('online'), 200);
+
+  // render entry point
+  render();
+
+  // ------- Helpers for message DOM append (exposed earlier) -------
+  function appendMessageDOM(container, m, room=null, pmPair=null) {
+    // function declared earlier; define here just in case called externally
+    const div = document.createElement('div');
+    const cls = m.from === me.username ? 'msg me' : 'msg other';
+    div.className = cls;
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.innerHTML = `<strong>${escapeHtml(m.from)}</strong> • <span class="small">${new Date(m.ts).toLocaleString()}</span>`;
+    const content = document.createElement('div');
+    content.innerHTML = escapeHtml(m.text).replace(/\n/g,'<br/>');
+    div.appendChild(meta);
+    div.appendChild(content);
+    container.appendChild(div);
+  }
+
+  // small polyfill-ish functions already used above
+  function renderMessagesForRoom(room){
+    const msgs = loadMsgsForRoom(room);
+    const container = document.getElementById('messagesArea');
+    if(!container) return;
+    container.innerHTML = '';
+    msgs.forEach(m => appendMessageDOM(container, m));
+    container.scrollTop = container.scrollHeight;
+  }
+  function renderMessagesForDM(a,b){
+    const msgs = loadMsgsForPM(a,b);
+    const container = document.getElementById('messagesArea');
+    if(!container) return;
+    container.innerHTML = '';
+    msgs.forEach(m => appendMessageDOM(container, m));
+    container.scrollTop = container.scrollHeight;
+  }
+
+  // ensure UI functions are available where used
+  window.p2p = { setUser }; // small debug hook
+
+})();
+</script>
+</body>
+</html>
